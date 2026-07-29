@@ -7,6 +7,8 @@ Usage:
   python extract_guidance.py --ticker AAPL --form 10-K --top-k 8
   python extract_guidance.py --query "What did management say about iPhone revenue?"
 """
+from __future__ import annotations
+
 import argparse
 import os
 import sys
