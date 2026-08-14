@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 """
-Extract forward-looking guidance from SEC 10-K/10-Q filings via the RAG pipeline.
+Extract forward-looking guidance from SEC 10-K/10-Q filings.
+
+Two modes:
+  - light (default): self-contained. Fetches from EDGAR, in-memory BM25,
+    calls Claude/OpenAI. No infra needed. Requires ANTHROPIC_API_KEY or
+    OPENAI_API_KEY.
+  - heavy: delegates to a local RAG pipeline at $SEC_PIPELINE_DIR
+    (Elasticsearch + sentence-transformers + Ollama). Higher quality for
+    bulk/repeat use.
+
+Mode auto-detects: if SEC_PIPELINE_DIR is set AND the pipeline is importable
+AND Elasticsearch is reachable, heavy mode runs; otherwise light. Force with
+--mode {auto,light,heavy}.
 
 Usage:
   python extract_guidance.py --ticker AAPL --form 10-Q
   python extract_guidance.py --ticker AAPL --form 10-K --top-k 8
   python extract_guidance.py --query "What did management say about iPhone revenue?"
+  python extract_guidance.py --mode light --ticker MSFT
 """
 from __future__ import annotations
 
@@ -13,13 +26,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-
-_pipeline_env = os.environ.get("SEC_PIPELINE_DIR")
-if not _pipeline_env:
-    print("ERROR: SEC_PIPELINE_DIR is not set. Point it at your SEC RAG pipeline directory.")
-    sys.exit(1)
-PIPELINE_DIR = Path(_pipeline_env)
-sys.path.insert(0, str(PIPELINE_DIR))
 
 GUIDANCE_QUERIES = [
     "What is management's guidance and outlook for future revenue and earnings?",
@@ -30,7 +36,29 @@ GUIDANCE_QUERIES = [
 ]
 
 
-def check_index_status(es) -> tuple[int, list[str]]:
+def _heavy_available() -> tuple[bool, str]:
+    """Return (available, reason) — heavy needs SEC_PIPELINE_DIR + importable pipeline + reachable ES."""
+    d = os.environ.get("SEC_PIPELINE_DIR")
+    if not d:
+        return False, "SEC_PIPELINE_DIR not set"
+    p = Path(d)
+    if not p.is_dir():
+        return False, f"SEC_PIPELINE_DIR ({d}) is not a directory"
+    sys.path.insert(0, str(p))
+    try:
+        from pipeline.index import get_es  # noqa: F401
+    except Exception as e:
+        return False, f"pipeline not importable from {d}: {e}"
+    try:
+        es = get_es()
+        if not es.ping():
+            return False, "Elasticsearch ping failed"
+    except Exception as e:
+        return False, f"Elasticsearch unreachable: {e}"
+    return True, "ok"
+
+
+def check_index_status(es):
     from pipeline.index import INDEX
     if not es.indices.exists(index=INDEX):
         return 0, []
@@ -47,41 +75,24 @@ def check_index_status(es) -> tuple[int, list[str]]:
     return count, files
 
 
-def run_guidance_extraction(
-    ticker: str = "AAPL",
-    form_type: str = "10-Q",
-    top_k: int = 5,
-    custom_query: str | None = None,
-) -> None:
-    try:
-        from pipeline.embed import Embedder
-        from pipeline.index import get_es
-        from pipeline.retrieve import hybrid_search
-        from pipeline.rerank import Reranker
-        from pipeline.answer import generate_answer
-    except ImportError as e:
-        print(f"ERROR: Cannot import pipeline — {e}")
-        print(f"Pipeline expected at: {PIPELINE_DIR}")
-        sys.exit(1)
+def run_heavy(ticker: str, form: str, top_k: int, custom_query: str | None) -> None:
+    from pipeline.embed import Embedder
+    from pipeline.index import get_es
+    from pipeline.retrieve import hybrid_search
+    from pipeline.rerank import Reranker
+    from pipeline.answer import generate_answer
 
     print(f"\n{'='*64}")
-    print(f"  SEC GUIDANCE EXTRACTOR | {ticker.upper()} {form_type.upper()}")
+    print(f"  SEC GUIDANCE (heavy mode) | {ticker.upper()} {form.upper()}")
     print(f"{'='*64}\n")
 
-    try:
-        embedder = Embedder()
-        es = get_es()
-    except Exception as e:
-        print(f"ERROR: Pipeline init failed — {e}")
-        print("Is Elasticsearch running? Try: docker ps | grep elastic")
-        sys.exit(1)
-
+    embedder = Embedder()
+    es = get_es()
     doc_count, indexed_files = check_index_status(es)
     if doc_count == 0:
         print("ERROR: Index is empty. Run first:")
-        print(f"  cd '{PIPELINE_DIR}' && python run_pipeline.py ingest")
+        print(f"  cd '{os.environ.get('SEC_PIPELINE_DIR')}' && python run_pipeline.py ingest")
         sys.exit(1)
-
     print(f"Index: {doc_count} docs across {len(indexed_files)} files\n")
 
     try:
@@ -91,22 +102,15 @@ def run_guidance_extraction(
         reranker = None
 
     queries = [custom_query] if custom_query else GUIDANCE_QUERIES
-
     for i, query in enumerate(queries, 1):
         print(f"[{i}/{len(queries)}] {query}")
         print("─" * 64)
-
         try:
             candidates = hybrid_search(query, embedder, es, top_k=top_k * 4)
             if not candidates:
                 print("  No relevant passages found.\n")
                 continue
-
-            if reranker:
-                results = reranker.rerank(query, candidates, top_k=top_k)
-            else:
-                results = candidates[:top_k]
-
+            results = reranker.rerank(query, candidates, top_k=top_k) if reranker else candidates[:top_k]
             out = generate_answer(query, results)
             print(out["answer"])
             print("\nSources:")
@@ -115,29 +119,58 @@ def run_guidance_extraction(
                 page = src.get("page_number", "?")
                 print(f"  [{src['num']}] {src['source_file']}  p.{page}  filed {date}")
             print()
-
         except Exception as e:
             print(f"  ERROR: {e}\n")
 
-    print(f"{'='*64}")
-    print("Done.")
+    print(f"{'='*64}\nDone.")
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract management guidance from SEC 10-K/10-Q filings"
     )
-    parser.add_argument("--ticker", default="AAPL", help="Stock ticker (default: AAPL)")
-    parser.add_argument("--form", default="10-Q", choices=["10-Q", "10-K"],
-                        help="SEC form type (default: 10-Q)")
-    parser.add_argument("--top-k", type=int, default=5,
-                        help="Passages per query (default: 5)")
-    parser.add_argument("--query", help="Run a single custom guidance question instead")
+    parser.add_argument("--ticker", default="AAPL")
+    parser.add_argument("--form", default="auto",
+                        choices=["auto", "10-Q", "10-K", "20-F", "40-F", "6-K"],
+                        help="auto tries 10-Q → 10-K → 20-F → 40-F → 6-K "
+                             "(foreign private issuers file the latter three)")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--query", help="Single custom guidance question")
+    parser.add_argument("--json", action="store_true",
+                        help="Structured JSON output (light mode only)")
+    parser.add_argument("--mode", default="auto", choices=["auto", "light", "heavy"],
+                        help="Force a mode. Default auto: heavy if available, else light.")
     args = parser.parse_args()
 
-    run_guidance_extraction(
-        ticker=args.ticker,
-        form_type=args.form,
-        top_k=args.top_k,
-        custom_query=args.query,
-    )
+    if args.mode == "heavy":
+        ok, reason = _heavy_available()
+        if not ok:
+            print(f"ERROR: --mode heavy requested but unavailable ({reason})")
+            sys.exit(1)
+        if args.json:
+            print("WARNING: --json is light-mode only, ignoring", file=sys.stderr)
+        form = "10-Q" if args.form == "auto" else args.form
+        run_heavy(args.ticker, form, args.top_k, args.query)
+        return
+
+    if args.mode == "light":
+        from sec_guidance_light import run_light
+        run_light(args.ticker, args.form, max(args.top_k, 8), args.query,
+                  as_json=args.json)
+        return
+
+    # auto
+    ok, reason = _heavy_available()
+    if ok and not args.json:
+        form = "10-Q" if args.form == "auto" else args.form
+        run_heavy(args.ticker, form, args.top_k, args.query)
+    else:
+        print(f"[mode] heavy unavailable ({reason}) — using light" if not ok
+              else "[mode] --json requested — using light", file=sys.stderr)
+        from sec_guidance_light import run_light
+        run_light(args.ticker, args.form, max(args.top_k, 8), args.query,
+                  as_json=args.json)
+
+
+if __name__ == "__main__":
+    main()
