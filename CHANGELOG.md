@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.5.1 — 2026-11-09
+
+- Simplified the `--diff` grading prompt and trimmed docs.
+
+## 0.5.0 — 2026-11-09
+
+- **Guidance revision detection (`--diff`)**: compares the two most recent
+  guidance-bearing filings and emits graded revision events (RAISED / LOWERED
+  / NARROWED / WIDENED / REAFFIRMED / INITIATED / WITHDRAWN / DROPPED) with
+  direction, midpoint magnitude, horizon, attribution (structural vs timing),
+  significance, and verbatim quotes from both filings. `--diff --json` emits
+  structured events plus both snapshots.
+- **8-K Item 2.02 support (diff path)**: quarterly guidance updates live in
+  earnings-release exhibits, not the 10-Q — the diff targets the two most
+  recent Item 2.02 8-Ks, resolving EX-99.* exhibits via the filing index's
+  Type column (exhibit filenames are arbitrary), with 10-Q/10-K fallback.
+  Guidance snapshots are cached per accession under
+  `~/.cache/sec-guidance/snapshots/`.
+- **`claude` CLI fallback provider**: with no `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` set, a local `claude` CLI (Claude Code subscription) is
+  used automatically for answers, snapshots, and diffs.
+- Watch-mode cron recipe in SKILL.md: scheduled diffs over a personal
+  watchlist, quiet unless guidance actually moved.
+
+## 0.4.2 — 2026-10-20
+
+- **Heavy mode is now ticker-scoped**: answers are drawn only from documents
+  the index labels with the requested ticker. Previously, on a multi-company
+  index, retrieval ran unfiltered and could present another company's filings
+  under the requested ticker's banner. Heavy mode now resolves the ticker's
+  `source_file` set up front, post-filters every retrieval hit against it, and
+  refuses to answer (with a clear error and a light-mode suggestion) when the
+  index has no documents labeled with that ticker.
+- Re-bundle `skill-card.md` (missing from the 0.4.1 artifact).
+
+## 0.4.1 — 2026-10-20
+
+- **`--demo` is now strictly offline**: it forces retrieval-only and never
+  calls an LLM even when `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` is set in the
+  environment — so the "no network, no API key" promise holds and no question
+  or passage is ever sent to a paid/external service from the demo path.
+
+## 0.4.0 — 2026-10-20
+
+Retrieval-quality round: fix the misses that let a revenue *history* table
+outrank the revenue *outlook*, and make first-run frictionless.
+
+- **Section-aware chunking**: the filing is split on real SEC section headers
+  (MD&A, Results of Operations, Outlook, Forward-Looking Statements, Risk
+  Factors); chunks never straddle a section and carry their section label.
+- **Section-aware ranking**: forward-looking sections (MD&A/Outlook/FLS) are
+  boosted and numeric tables are down-weighted, plus query-side guidance-synonym
+  expansion so BM25 fires on "we anticipate…" prose, not just the word "outlook".
+  On the bundled AAPL 10-Q this takes the recall check from **0/3 → 3/3**
+  guidance-dense chunks covered, and removes the revenue-table-ranked-#1 bug.
+- **Pure-Python BM25**: dropped the `rank_bm25` dependency — one less thing to
+  pip-install on a fresh machine.
+- **`--demo TICKER`**: runs the whole pipeline on a bundled cached filing with
+  **no network, no API key, and no third-party packages** — see real output in
+  seconds before any setup.
+- **Section labels surfaced** in sources, JSON, and the LLM context.
+- SKILL.md opener now leads with the differentiators (verifiable citations +
+  honest recall) instead of caveats.
+
 ## 0.3.0 — 2026-08-14
 
 Mentor-review round: foreign issuers, verifiable citations, recall check, UX.

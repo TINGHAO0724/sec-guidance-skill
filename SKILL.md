@@ -1,7 +1,7 @@
 ---
 name: sec-guidance
-description: Extract management guidance and forward-looking statements from SEC filings (10-K/10-Q, and 20-F/40-F/6-K for foreign private issuers). Self-contained by default (fetches from EDGAR, in-memory BM25, Claude/OpenAI). Optional heavy mode delegates to a local RAG pipeline.
-version: 0.3.0
+description: Extract management guidance from SEC filings (10-K/10-Q, and 20-F/40-F/6-K for foreign private issuers) with verifiable inline citations and an honest recall check — and detect guidance REVISIONS (--diff) by comparing consecutive earnings 8-Ks and emitting graded events (raised/lowered/narrowed/dropped, with magnitude, horizon, and verbatim quotes). Self-contained (EDGAR + pure-Python BM25 + Claude/OpenAI or local claude CLI). Optional heavy mode delegates to a local RAG pipeline.
+version: 0.5.1
 metadata:
   openclaw:
     requires:
@@ -12,24 +12,112 @@ metadata:
 
 # SEC Guidance Extractor
 
-Fetches the latest SEC filing for a ticker from EDGAR, ranks passages with
-BM25, and asks Claude (or OpenAI) to answer forward-looking questions with
-inline citations. Handles both domestic filers (10-Q/10-K) and foreign
-private issuers (20-F/40-F/6-K) via `--form auto`.
+Ask what management said about the future — revenue, margins, outlook — and get
+an answer **grounded in the actual SEC filing, with inline `[n]` citations you
+can click back to the source.** Every run ends with a **recall check** that
+tells you, honestly, which guidance-dense passages the retriever did *not*
+surface — so you know what you're not seeing, instead of trusting a black box.
 
-## Quickstart (light mode — default)
+What makes the retrieval trustworthy:
+
+- **Section-aware** — the filing is split into its real SEC sections (MD&A,
+  Results of Operations, Outlook, Forward-Looking Statements, Risk Factors) and
+  forward-looking prose is boosted, so a revenue *history* table no longer
+  outranks the revenue *outlook* paragraph.
+- **Verifiable, not generative** — answers cite numbered passages; the model is
+  told to say "not in the filing" rather than speculate, and never to give
+  trading advice.
+
+Handles domestic filers (10-Q/10-K) and foreign private issuers (20-F/40-F/6-K)
+via `--form auto`.
+
+## Try it in 5 seconds — no key, no install
 
 ```bash
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY; optional, see below
+python sec_guidance_light.py --demo AAPL
+```
+
+Runs the full pipeline on a bundled cached Apple 10-Q — **no network, no API
+key, no third-party packages** (BM25 is pure Python). This is the fastest way
+to see real output before committing to setup.
+
+## Revision detection (`--diff`) — the signal, not the level
+
+A guidance *level* is a data point. The tradeable object is the **revision**:
+management raising, cutting, narrowing, or quietly dropping a metric versus
+what they themselves said last quarter. `--diff` compares the two most recent
+guidance-bearing filings and emits graded revision events:
+
+```bash
+python extract_guidance.py --ticker SGI --diff
+```
+
+```
+🔴 GUIDANCE REVISION — SGI: FY2026 adjusted EPS guide narrowed from the top,
+   cutting ceiling $3.15→$2.95; implied YoY growth decelerates from ~11% to ~7%.
+   8-K 2026-11-09 vs 8-K 2026-08-06
+
+🔴 FY2026 adjusted EPS: $2.85 to $3.15 → $2.85 to $2.95  [LOWERED -3.3%]
+   (current_fy, unclear)
+     Floor held, ceiling cut $0.20
+     prior: "...range of $2.85 to $3.15, ... approximate 11% increase from 2025..."
+     new:   "...range of $2.85 to $2.95, ... approximate 7% increase from 2025..."
+```
+
+Where it looks: quarterly guidance updates live in **8-K Item 2.02 earnings
+releases** (the EX-99 exhibits), not the 10-Q — so `--diff` targets the two
+most recent Item 2.02 8-Ks (exhibit text fetched via the filing index's Type
+column) and falls back to 10-Q/10-K MD&A for companies that don't file them.
+Snapshots are cached per accession under `~/.cache/sec-guidance/snapshots/`,
+so repeat diffs are one cheap comparison call.
+
+Each change is classified as RAISED / LOWERED / NARROWED / WIDENED /
+REAFFIRMED / INITIATED / WITHDRAWN / DROPPED (a metric management guided on
+last time and no longer guides on), with midpoint magnitude, horizon
+(current quarter / current FY / long-dated), attribution when the filing
+states a reason, and a significance grade.
+
+Output is **events, not advice**: direction, magnitude, horizon, attribution,
+significance, and verbatim quotes from both filings so every claim is
+verifiable. `--diff --json` emits the same as structured JSON (plus both
+snapshots) for piping into your own process.
+
+### Watch mode (where the timeliness comes from)
+
+An ad-hoc diff is a post-mortem; a scheduled one is a signal. Cron recipe for
+your own watchlist — quiet unless something actually changed:
+
+```bash
+#!/bin/sh
+# guidance-watch.sh — run daily after market open
+for T in SGI CEG WING; do
+  OUT=$(python extract_guidance.py --ticker "$T" --diff --json 2>/dev/null)
+  echo "$OUT" | python -c "
+import json,sys
+d=json.load(sys.stdin)
+ev=[e for e in d['events'] if e['direction'] not in ('REAFFIRMED',)]
+if ev and d['overall']!='LOW':
+    print(f\"{d['ticker']}: {d['summary']}\")" \
+  # pipe non-empty output to mail / Slack / your notifier
+done
+```
+
+Snapshot caching makes this cheap: a day with no new filing re-diffs two
+cached snapshots; the LLM extraction only runs when a new accession appears.
+
+## Quickstart (light mode — live EDGAR)
+
+```bash
+pip install -r requirements.txt          # requests + beautifulsoup4 (+ anthropic for answers)
+export ANTHROPIC_API_KEY=sk-ant-...       # or OPENAI_API_KEY; optional, see below
 python extract_guidance.py --ticker AAPL
 ```
 
-That's it. No Docker, no Elasticsearch, no Ollama.
+No Docker, no Elasticsearch, no Ollama.
 
-**No API key?** The skill still runs: it prints the top-ranked filing
-passages with quotes instead of synthesized answers, and tells you which
-key to set to get full answers.
+**No API key?** It still runs: prints the top-ranked, section-labeled passages
+with quotes and the recall check, and tells you which key unlocks synthesized
+answers.
 
 ## When to invoke
 
@@ -37,6 +125,8 @@ key to set to get full answers.
 - User asks for guidance from an SEC filing (10-K, 10-Q, 20-F, 6-K)
 - User asks "what is [company]'s guidance for next quarter?"
 - User wants forward-looking statements or risk factors from SEC filings
+- User asks whether a company raised/cut/changed its guidance, or what changed
+  vs last quarter → use `--diff`
 
 ## When NOT to invoke (boundaries)
 
@@ -57,6 +147,9 @@ call commentary.
 ## Options
 
 ```bash
+# Offline demo: bundled filing, no network / key / deps
+python extract_guidance.py --demo AAPL
+
 # Auto form selection (default): 10-Q → 10-K → 20-F → 40-F → 6-K
 python extract_guidance.py --ticker BABA          # foreign issuer → picks 20-F/6-K
 
@@ -80,12 +173,15 @@ python extract_guidance.py --mode heavy --ticker NVDA
 |---|---|---|
 | `ANTHROPIC_API_KEY` | no* | Claude API key (preferred) |
 | `OPENAI_API_KEY` | no* | OpenAI API key (fallback) |
+| *(none, `claude` CLI on PATH)* | no* | Claude Code subscription fallback — used automatically when no API key is set |
 | `SEC_GUIDANCE_UA` | no | User-Agent for EDGAR requests. SEC rate-limits generic UAs — set to `"yourname you@example.com"` if you make many requests. |
 | `SEC_GUIDANCE_MODEL` | no | Override default LLM model. Anthropic default: `claude-sonnet-4-6`. OpenAI default: `gpt-4o-mini`. |
 | `SEC_PIPELINE_DIR` | no | Enables heavy mode — see below. |
 
-*With neither key set, output degrades to ranked passages with quotes (no
-synthesized answers).
+*With no key set, a local `claude` CLI is used if present; otherwise output
+degrades to ranked passages with quotes (no synthesized answers). `--diff`
+requires one of the three — snapshot extraction and grading are judgment
+steps, not retrieval.
 
 ## Standard queries (default, when `--query` not given)
 
@@ -130,8 +226,17 @@ worth the setup only if you're querying hundreds of tickers per day.
 `--json` and `--form auto` are light-mode features; heavy mode maps `auto`
 to 10-Q.
 
+**Ticker scoping.** A shared index may hold many companies' filings, so heavy
+mode answers only from documents the index labels with the requested ticker:
+it resolves that ticker's `source_file` set up front and post-filters every
+retrieval hit against it. If the index has no documents labeled with the
+ticker (not ingested, or your pipeline doesn't populate a `ticker` field),
+heavy mode exits with an error instead of answering from other companies'
+documents — use light mode in that case.
+
 Heavy-mode pipeline expected layout:
-- `pipeline/index.py` exports `get_es()`, `INDEX`
+- `pipeline/index.py` exports `get_es()`, `INDEX` (docs carry `ticker` and
+  `source_file` keyword fields)
 - `pipeline/embed.py` exports `Embedder`
 - `pipeline/retrieve.py` exports `hybrid_search(query, embedder, es, top_k)`
 - `pipeline/rerank.py` exports `Reranker` (optional)

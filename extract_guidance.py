@@ -75,6 +75,20 @@ def check_index_status(es):
     return count, files
 
 
+def ticker_source_files(es, ticker: str) -> set[str]:
+    """Return source_file names whose indexed chunks are labeled with this ticker."""
+    from pipeline.index import INDEX
+    agg = es.search(
+        index=INDEX,
+        body={
+            "size": 0,
+            "query": {"term": {"ticker": ticker.upper()}},
+            "aggs": {"files": {"terms": {"field": "source_file", "size": 1000}}},
+        },
+    )
+    return {b["key"] for b in agg["aggregations"]["files"]["buckets"]}
+
+
 def run_heavy(ticker: str, form: str, top_k: int, custom_query: str | None) -> None:
     from pipeline.embed import Embedder
     from pipeline.index import get_es
@@ -93,7 +107,25 @@ def run_heavy(ticker: str, form: str, top_k: int, custom_query: str | None) -> N
         print("ERROR: Index is empty. Run first:")
         print(f"  cd '{os.environ.get('SEC_PIPELINE_DIR')}' && python run_pipeline.py ingest")
         sys.exit(1)
-    print(f"Index: {doc_count} docs across {len(indexed_files)} files\n")
+    print(f"Index: {doc_count} docs across {len(indexed_files)} files")
+
+    # The shared index may hold many companies' filings. Answers must come
+    # only from the requested ticker's documents — never silently present
+    # another company's filings under this ticker's banner.
+    try:
+        allowed_files = ticker_source_files(es, ticker)
+    except Exception as e:
+        print(f"ERROR: Could not resolve {ticker.upper()}'s documents in the index ({e}).")
+        print("Refusing to answer from an unfiltered multi-company index.")
+        sys.exit(1)
+    if not allowed_files:
+        print(f"ERROR: Index has no documents labeled ticker={ticker.upper()}.")
+        print("Either ingest this ticker's filings, or your pipeline does not label")
+        print("chunks with a 'ticker' field — heavy mode cannot safely attribute")
+        print("answers without it. Falling back is unsafe; use light mode instead:")
+        print(f"  python extract_guidance.py --mode light --ticker {ticker.upper()}")
+        sys.exit(1)
+    print(f"Scope: {len(allowed_files)} file(s) labeled {ticker.upper()}\n")
 
     try:
         reranker = Reranker()
@@ -107,8 +139,9 @@ def run_heavy(ticker: str, form: str, top_k: int, custom_query: str | None) -> N
         print("─" * 64)
         try:
             candidates = hybrid_search(query, embedder, es, top_k=top_k * 4)
+            candidates = [c for c in candidates if c.get("source_file") in allowed_files]
             if not candidates:
-                print("  No relevant passages found.\n")
+                print(f"  No relevant passages found in {ticker.upper()}'s filings.\n")
                 continue
             results = reranker.rerank(query, candidates, top_k=top_k) if reranker else candidates[:top_k]
             out = generate_answer(query, results)
@@ -131,16 +164,42 @@ def main() -> None:
     )
     parser.add_argument("--ticker", default="AAPL")
     parser.add_argument("--form", default="auto",
-                        choices=["auto", "10-Q", "10-K", "20-F", "40-F", "6-K"],
+                        choices=["auto", "10-Q", "10-K", "20-F", "40-F", "6-K", "8-K"],
                         help="auto tries 10-Q → 10-K → 20-F → 40-F → 6-K "
-                             "(foreign private issuers file the latter three)")
+                             "(foreign private issuers file the latter three); "
+                             "8-K is --diff only (Item 2.02 earnings releases)")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--query", help="Single custom guidance question")
     parser.add_argument("--json", action="store_true",
                         help="Structured JSON output (light mode only)")
+    parser.add_argument("--demo", metavar="TICKER", nargs="?", const="AAPL",
+                        help="Run light mode on a bundled cached filing — no "
+                             "network, no API key, no third-party deps (default AAPL)")
     parser.add_argument("--mode", default="auto", choices=["auto", "light", "heavy"],
                         help="Force a mode. Default auto: heavy if available, else light.")
+    parser.add_argument("--diff", action="store_true",
+                        help="Guidance revision detection: compare the two most "
+                             "recent guidance-bearing filings (8-K Item 2.02 "
+                             "earnings releases first, then 10-Q/10-K) and emit "
+                             "graded revision events (raised/lowered/dropped/...). "
+                             "Needs an LLM (API key or `claude` CLI).")
     args = parser.parse_args()
+
+    if args.diff:
+        from guidance_diff import run_diff
+        run_diff(args.ticker, args.form, as_json=args.json)
+        return
+
+    if args.form == "8-K":
+        print("ERROR: --form 8-K is only meaningful with --diff (earnings-"
+              "release revision detection). For one-off extraction use "
+              "--form auto.")
+        sys.exit(1)
+
+    if args.demo:
+        from sec_guidance_light import run_demo
+        run_demo(args.demo, max(args.top_k, 8), args.query, as_json=args.json)
+        return
 
     if args.mode == "heavy":
         ok, reason = _heavy_available()

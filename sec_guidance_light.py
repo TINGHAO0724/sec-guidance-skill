@@ -3,43 +3,36 @@ Light-mode SEC guidance extractor: self-contained, no ES / Ollama / RAG infra.
 
 Fetches the most recent filing for a ticker directly from EDGAR (10-Q/10-K for
 domestic filers, 20-F/40-F/6-K for foreign private issuers — `--form auto`
-walks that chain), chunks the filing in memory, ranks passages with BM25, and
-asks Claude (or OpenAI) to answer with inline citations.
+walks that chain), splits the filing into its real SEC sections (MD&A, Results
+of Operations, Outlook, Forward-Looking Statements, Risk Factors), ranks
+passages with a section-aware BM25, and asks Claude (or OpenAI) to answer with
+inline citations.
+
+Retrieval is lexical and dependency-light: a pure-Python BM25 (no rank_bm25),
+query-side guidance-synonym expansion, a section boost for forward-looking
+prose, and a down-weight for numeric tables — so a revenue *history* table no
+longer outranks the revenue *outlook* paragraph. The built-in recall check
+reports which guidance-dense chunks BM25 still missed.
 
 Trades ~20% answer quality vs the heavy pipeline for zero-infra setup — good
 enough for a single-ticker one-off lookup. For 100+ tickers/day, use the heavy
 pipeline (mode=heavy, requires SEC_PIPELINE_DIR).
 
 With no LLM API key set, degrades to retrieval-only output (ranked passages
-with quotes) instead of failing.
+with quotes) instead of failing. `--demo AAPL` runs the whole pipeline on a
+bundled cached filing — no network, no API key, no third-party deps.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
-
-try:
-    import requests
-except ImportError:
-    print("ERROR: `requests` is required. Install: pip install -r requirements.txt")
-    sys.exit(1)
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("ERROR: `beautifulsoup4` is required. Install: pip install -r requirements.txt")
-    sys.exit(1)
-
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    print("ERROR: `rank_bm25` is required. Install: pip install -r requirements.txt")
-    sys.exit(1)
 
 UA = os.environ.get(
     "SEC_GUIDANCE_UA",
@@ -47,6 +40,7 @@ UA = os.environ.get(
 )
 HEADERS = {"User-Agent": UA}
 CACHE_DIR = Path.home() / ".cache" / "sec-guidance"
+DEMO_DIR = Path(__file__).resolve().parent / "demo"
 CHUNK_CHARS = 1500
 CHUNK_OVERLAP = 200
 DEFAULT_TOP_K = 8
@@ -56,12 +50,22 @@ DEFAULT_TOP_K = 8
 FORM_CHAIN = ["10-Q", "10-K", "20-F", "40-F", "6-K"]
 FORM_CHOICES = ["auto"] + FORM_CHAIN
 
-# Chunks with >=3 hits are counted as "guidance-dense" for the recall check.
+# Chunks with >=threshold hits are counted as "guidance-dense" for the recall
+# check (threshold adapts to terse filers — see _recall_note).
 GUIDANCE_KEYWORD_RE = re.compile(
     r"\b(guidance|outlook|expect(?:s|ed|ing)?|anticipat\w*|forecast\w*|"
     r"target(?:s|ed|ing)?|project(?:s|ed|ing)?|fiscal (?:year )?20\d\d)\b",
     re.IGNORECASE,
 )
+
+# Appended to every guidance query so BM25 also fires on forward-looking prose
+# that phrases the same idea differently ("we anticipate" vs "outlook"). These
+# are the signal we always want; the query's distinctive terms still dominate.
+GUIDANCE_SYNONYMS = [
+    "guidance", "outlook", "expect", "expects", "expected", "anticipate",
+    "anticipated", "forecast", "project", "projected", "future", "forward",
+    "estimate", "estimated", "intend", "plan", "believe",
+]
 
 GUIDANCE_QUERIES = [
     "What is management's guidance and outlook for future revenue and earnings?",
@@ -71,6 +75,24 @@ GUIDANCE_QUERIES = [
     "What macroeconomic conditions, risks, or uncertainties did management highlight for upcoming quarters?",
 ]
 
+# --- Section detection ---------------------------------------------------
+# Each pattern maps a filing section to a retrieval weight. Forward-looking
+# prose (MD&A / Outlook / FLS) is boosted; numeric/boilerplate sections are
+# left neutral or trimmed. A line is treated as a header only when it is short
+# (<120 chars) so in-prose mentions ("...forward-looking statements, see...")
+# don't split a paragraph.
+SECTION_PATTERNS = [
+    ("OUTLOOK", 1.8, re.compile(r"\b(business\s+outlook|^\s*outlook\b|guidance\s+summary)\b", re.I)),
+    ("MDA", 1.6, re.compile(r"\b(management.?s discussion and analysis|results of operations|liquidity and capital resources)\b", re.I)),
+    ("FORWARD", 1.5, re.compile(r"\bforward.?looking statements?\b", re.I)),
+    ("RISK", 1.15, re.compile(r"\brisk factors\b", re.I)),
+    ("QUANT", 1.1, re.compile(r"\bquantitative and qualitative disclosures\b", re.I)),
+    ("FIN", 0.9, re.compile(r"\b(financial statements|notes to (?:the )?condensed|condensed consolidated)\b", re.I)),
+]
+SECTION_WEIGHT = {lbl: w for lbl, w, _ in SECTION_PATTERNS}
+SECTION_WEIGHT["OTHER"] = 1.0
+HEADER_MAX_LEN = 120
+
 
 def _cache_path(key: str) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,8 +100,14 @@ def _cache_path(key: str) -> Path:
     return CACHE_DIR / safe
 
 
-def _get(url: str, timeout: int = 30) -> requests.Response:
+def _get(url: str, timeout: int = 30):
     """GET with retry/backoff — EDGAR throttles (429) and hiccups under load."""
+    try:
+        import requests
+    except ImportError:
+        print("ERROR: `requests` is required for live fetch. "
+              "Install: pip install -r requirements.txt  (or try --demo AAPL)")
+        sys.exit(1)
     last = ""
     for pause in (0, 2, 5):
         if pause:
@@ -150,6 +178,12 @@ def _fetch_and_extract_text(url: str, filing_key: str) -> str:
     cache = _cache_path(f"filing__{filing_key}.txt")
     if cache.exists():
         return cache.read_text()
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("ERROR: `beautifulsoup4` is required for live fetch. "
+              "Install: pip install -r requirements.txt  (or try --demo AAPL)")
+        sys.exit(1)
     r = _get(url, timeout=60)
     soup = BeautifulSoup(r.text, "html.parser")
     for tag in soup(["script", "style", "meta", "link"]):
@@ -169,6 +203,33 @@ def _fetch_and_extract_text(url: str, filing_key: str) -> str:
     return text
 
 
+def _classify_header(line: str) -> str | None:
+    """Return a section label if this line looks like a section header, else None."""
+    s = line.strip()
+    if not s or len(s) > HEADER_MAX_LEN:
+        return None
+    for lbl, _w, pat in SECTION_PATTERNS:
+        if pat.search(s):
+            return lbl
+    return None
+
+
+def _split_sections(text: str) -> list[tuple[str, str]]:
+    """Split filing text into (label, body) segments by SEC section headers.
+
+    Every line is assigned to the most recent header seen; the table-of-contents
+    at the top produces tiny throwaway segments (header-to-header), while the
+    real body segments carry the bulk of the text under the correct label."""
+    segments: list[tuple[str, list[str]]] = [("OTHER", [])]
+    for line in text.split("\n"):
+        lbl = _classify_header(line)
+        if lbl is not None:
+            segments.append((lbl, [line]))
+        else:
+            segments[-1][1].append(line)
+    return [(lbl, "\n".join(lines)) for lbl, lines in segments if "".join(lines).strip()]
+
+
 def _chunk(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
     chunks = []
     i = 0
@@ -181,23 +242,89 @@ def _chunk(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> 
     return chunks
 
 
-def _bm25_topk(query: str, chunks: list[str], k: int) -> list[tuple[int, float, str]]:
-    tokenized = [re.findall(r"\w+", c.lower()) for c in chunks]
-    bm25 = BM25Okapi(tokenized)
-    q_tok = re.findall(r"\w+", query.lower())
-    scores = bm25.get_scores(q_tok)
-    ranked = sorted(enumerate(scores), key=lambda x: -x[1])[:k]
-    return [(idx, float(score), chunks[idx]) for idx, score in ranked]
+def _chunk_sections(text: str) -> list[tuple[str, str]]:
+    """Section-aware chunking: a chunk never straddles two sections, and carries
+    its section label. Returns list of (chunk_text, section_label)."""
+    out: list[tuple[str, str]] = []
+    for lbl, body in _split_sections(text):
+        for c in _chunk(body):
+            out.append((c, lbl))
+    return out
+
+
+def _tokenize(s: str) -> list[str]:
+    return re.findall(r"\w+", s.lower())
+
+
+class _BM25:
+    """Pure-Python BM25-Okapi (no rank_bm25 dependency)."""
+
+    def __init__(self, corpus_tokens: list[list[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1, self.b = k1, b
+        self.docs = corpus_tokens
+        self.n = len(corpus_tokens)
+        self.doc_len = [len(d) for d in corpus_tokens]
+        self.avgdl = (sum(self.doc_len) / self.n) if self.n else 0.0
+        self.tf = [Counter(d) for d in corpus_tokens]
+        df: Counter = Counter()
+        for d in corpus_tokens:
+            df.update(set(d))
+        # BM25 idf with +1 smoothing so it never goes negative on common terms.
+        self.idf = {t: math.log(1 + (self.n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
+
+    def scores(self, q_tokens: list[str]):
+        q = Counter(q_tokens)
+        out = [0.0] * self.n
+        for i in range(self.n):
+            tf, dl = self.tf[i], self.doc_len[i]
+            denom_base = self.k1 * (1 - self.b + self.b * dl / self.avgdl) if self.avgdl else self.k1
+            s = 0.0
+            for term, qc in q.items():
+                f = tf.get(term, 0)
+                if not f:
+                    continue
+                s += self.idf.get(term, 0.0) * qc * (f * (self.k1 + 1)) / (f + denom_base)
+            out[i] = s
+        return out
+
+
+def _table_penalty(text: str) -> float:
+    """0..~0.6 penalty for numeric-table-like chunks (digits/$/%/short tokens),
+    so a revenue *history* table doesn't outrank a revenue *outlook* paragraph."""
+    toks = _tokenize(text)
+    if not toks:
+        return 0.0
+    numeric = sum(1 for t in toks if t.isdigit())
+    frac = numeric / len(toks)
+    if frac <= 0.12:
+        return 0.0
+    return min(0.6, (frac - 0.12) * 1.5)
+
+
+def _rank(query: str, chunks: list[tuple[str, str]], bm25: "_BM25",
+          k: int, expand: bool = True) -> list[tuple[int, float, str, str]]:
+    """Section-aware ranking. Returns (chunk_idx, final_score, text, label)."""
+    q_tok = _tokenize(query)
+    if expand:
+        q_tok = q_tok + GUIDANCE_SYNONYMS
+    raw = bm25.scores(q_tok)
+    scored = []
+    for idx, (text, lbl) in enumerate(chunks):
+        weight = SECTION_WEIGHT.get(lbl, 1.0)
+        final = raw[idx] * weight * (1.0 - _table_penalty(text))
+        scored.append((idx, final, text, lbl))
+    scored.sort(key=lambda x: -x[1])
+    return scored[:k]
 
 
 def _snippet(text: str, chars: int = 180) -> str:
     return re.sub(r"\s+", " ", text.strip())[:chars]
 
 
-def _recall_note(chunks: list[str], picked: set[int]) -> tuple[str, dict]:
+def _recall_note(chunks: list[tuple[str, str]], picked: set[int]) -> tuple[str, dict]:
     """Coverage of guidance-dense chunks by the retrieved set — a cheap
     honesty check on BM25, not a guarantee of completeness."""
-    hits = [len(GUIDANCE_KEYWORD_RE.findall(c)) for c in chunks]
+    hits = [len(GUIDANCE_KEYWORD_RE.findall(c)) for c, _ in chunks]
     # Adaptive threshold: terse filings (e.g. AAPL 10-Qs) never reach 3
     # keywords per chunk — fall back so the check doesn't go blind on them.
     threshold = 3 if any(h >= 3 for h in hits) else 2
@@ -210,28 +337,33 @@ def _recall_note(chunks: list[str], picked: set[int]) -> tuple[str, dict]:
         return "Recall check: no guidance-dense chunks detected in this filing.", stats
     note = (f"Recall check: retrieved set covers {stats['covered']}/{len(dense)} "
             f"guidance-dense chunks")
-    if stats["covered"] / len(dense) < 0.3:
+    if dense and stats["covered"] / len(dense) < 0.3:
         note += ("  ⚠ LOW — raise --top-k or ask a more specific --query; "
                  f"unretrieved dense chunks start at {stats['missed_chunk_indices'][:5]}")
     return note, stats
 
 
 def _pick_llm() -> tuple[str | None, str | None]:
-    """Return (provider, model). Prefer Anthropic, fall back to OpenAI.
-    Returns (None, None) when no key is set — caller degrades to retrieval-only."""
+    """Return (provider, model). Prefer Anthropic, then OpenAI, then a local
+    `claude` CLI (Claude Code subscription — no API key needed).
+    Returns (None, None) when none is available — caller degrades to
+    retrieval-only."""
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic", os.environ.get("SEC_GUIDANCE_MODEL", "claude-sonnet-4-6")
     if os.environ.get("OPENAI_API_KEY"):
         return "openai", os.environ.get("SEC_GUIDANCE_MODEL", "gpt-4o-mini")
+    import shutil
+    if shutil.which("claude"):
+        return "claude-cli", os.environ.get("SEC_GUIDANCE_MODEL", "sonnet")
     return None, None
 
 
-def _ask_llm(query: str, passages: list[tuple[int, float, str]],
+def _ask_llm(query: str, passages: list[tuple[int, float, str, str]],
              provider: str, model: str) -> str:
     """Send prompt + numbered passages to the LLM, return answer text."""
     context = "\n\n".join(
-        f"[{i + 1}] (chunk #{idx}, bm25={score:.2f})\n{text}"
-        for i, (idx, score, text) in enumerate(passages)
+        f"[{i + 1}] (chunk #{idx}, section={lbl}, score={score:.2f})\n{text}"
+        for i, (idx, score, text, lbl) in enumerate(passages)
     )
     system = ("You are a financial analyst extracting forward-looking guidance "
               "from SEC filings. Answer the question using ONLY the numbered "
@@ -239,6 +371,19 @@ def _ask_llm(query: str, passages: list[tuple[int, float, str]],
               "passages don't contain the answer, say so — do not speculate. "
               "Never give buy/sell/hold recommendations.")
     user = f"QUESTION: {query}\n\nPASSAGES:\n{context}"
+    return _ask_llm_raw(system, user, provider, model)
+
+
+def _ask_llm_raw(system: str, user: str, provider: str, model: str) -> str:
+    """Provider-dispatch for one system+user call, returns raw reply text."""
+    if provider == "claude-cli":
+        import subprocess
+        res = subprocess.run(
+            ["claude", "-p", "--model", model, "--system-prompt", system],
+            input=user, capture_output=True, text=True, timeout=180)
+        if res.returncode != 0:
+            raise RuntimeError(f"claude CLI failed: {res.stderr.strip()[:200]}")
+        return res.stdout.strip()
     if provider == "anthropic":
         try:
             import anthropic
@@ -265,6 +410,106 @@ def _ask_llm(query: str, passages: list[tuple[int, float, str]],
         )
         return resp.choices[0].message.content
     raise RuntimeError(f"Unknown provider: {provider}")
+
+
+def _run(ticker: str, resolved_form: str, filing: dict, text: str, top_k: int,
+         custom_query: str | None, as_json: bool, say, allow_llm: bool = True) -> None:
+    """Shared retrieval + answer path once filing text is in hand.
+
+    `allow_llm=False` forces retrieval-only even when an API key is set — the
+    offline `--demo` path uses this so it never makes a paid/external API call,
+    matching its "no network, no key" promise."""
+    chunks = _chunk_sections(text)
+    sec_counts = Counter(lbl for _, lbl in chunks)
+    say(f"Extracted {len(text):,} chars → {len(chunks)} chunks "
+        f"({', '.join(f'{k}:{v}' for k, v in sec_counts.most_common())})\n")
+
+    bm25 = _BM25([_tokenize(c) for c, _ in chunks])
+
+    if not allow_llm:
+        provider, model = None, None
+        say("Offline demo — retrieval only; no LLM call is made even if an API "
+            "key is set (no network, no external request).\n")
+    else:
+        provider, model = _pick_llm()
+        if provider:
+            say(f"LLM: {provider}/{model}\n")
+        else:
+            say("No LLM API key set (ANTHROPIC_API_KEY / OPENAI_API_KEY) — "
+                "showing ranked passages only, no synthesized answers.\n")
+
+    queries = [custom_query] if custom_query else GUIDANCE_QUERIES
+    all_picked: set[int] = set()
+    results = []
+    for i, query in enumerate(queries, 1):
+        say(f"[{i}/{len(queries)}] {query}")
+        say("─" * 64)
+        entry = {"query": query, "answer": None, "sources": [], "error": None}
+        try:
+            passages = _rank(query, chunks, bm25, top_k)
+            if not passages or all(p[1] <= 0 for p in passages):
+                say("  No candidate passages.\n")
+                results.append(entry)
+                continue
+            all_picked.update(idx for idx, _, _, _ in passages)
+            entry["sources"] = [
+                {"n": j, "chunk": idx, "section": lbl, "score": round(score, 2),
+                 "quote": _snippet(t)}
+                for j, (idx, score, t, lbl) in enumerate(passages, 1)
+            ]
+            if provider:
+                entry["answer"] = _ask_llm(query, passages, provider, model)
+                say(entry["answer"])
+            say("\nSources (verify against the filing URL above):")
+            for s in entry["sources"]:
+                say(f"  [{s['n']}] chunk #{s['chunk']}  [{s['section']}]  score={s['score']}")
+                say(f"      \"{s['quote']}…\"")
+            say("")
+        except Exception as e:
+            entry["error"] = str(e)
+            say(f"  ERROR: {e}\n")
+        results.append(entry)
+
+    recall_line, recall_stats = _recall_note(chunks, all_picked)
+    say(recall_line)
+    say(f"{'='*64}\nDone.")
+
+    if as_json:
+        print(json.dumps({
+            "ticker": ticker.upper(),
+            "form": resolved_form,
+            "filing_date": filing["filing_date"],
+            "accession": filing["accession"],
+            "filing_url": filing["primary_doc_url"],
+            "llm": f"{provider}/{model}" if provider else None,
+            "results": results,
+            "recall_check": recall_stats,
+        }, indent=2))
+
+
+def run_demo(ticker: str, top_k: int, custom_query: str | None,
+             as_json: bool = False) -> None:
+    """Run the full pipeline on a bundled cached filing — no network, no key,
+    no third-party deps. Proves the tool in seconds on a fresh machine."""
+    say = (lambda *a, **k: print(*a, file=sys.stderr, **k)) if as_json else print
+    meta_path = DEMO_DIR / f"{ticker.upper()}.json"
+    if not meta_path.exists():
+        avail = ", ".join(sorted(p.stem for p in DEMO_DIR.glob("*.json"))) or "(none bundled)"
+        print(f"ERROR: no bundled demo for {ticker.upper()}. Available: {avail}")
+        sys.exit(1)
+    meta = json.loads(meta_path.read_text())
+    text = (DEMO_DIR / meta["text_file"]).read_text()
+    say(f"\n{'='*64}")
+    say(f"  SEC GUIDANCE (demo — bundled filing, no network/key) | "
+        f"{ticker.upper()} {meta['form']}")
+    say(f"{'='*64}\n")
+    say(f"Filing: {meta['form']} {meta['filing_date']}  accession={meta['accession']}")
+    say(f"URL: {meta['primary_doc_url']}\n")
+    _run(ticker, meta["form"], {
+        "filing_date": meta["filing_date"],
+        "accession": meta["accession"],
+        "primary_doc_url": meta["primary_doc_url"],
+    }, text, top_k, custom_query, as_json, say, allow_llm=False)
 
 
 def run_light(ticker: str, form: str, top_k: int, custom_query: str | None,
@@ -298,62 +543,7 @@ def run_light(ticker: str, form: str, top_k: int, custom_query: str | None,
 
     filing_key = f"{ticker.upper()}_{resolved_form.replace('-','')}_{filing['accession']}"
     text = _fetch_and_extract_text(filing['primary_doc_url'], filing_key)
-    chunks = _chunk(text)
-    say(f"Extracted {len(text):,} chars → {len(chunks)} chunks\n")
-
-    provider, model = _pick_llm()
-    if provider:
-        say(f"LLM: {provider}/{model}\n")
-    else:
-        say("No LLM API key set (ANTHROPIC_API_KEY / OPENAI_API_KEY) — "
-            "showing ranked passages only, no synthesized answers.\n")
-
-    queries = [custom_query] if custom_query else GUIDANCE_QUERIES
-    all_picked: set[int] = set()
-    results = []
-    for i, query in enumerate(queries, 1):
-        say(f"[{i}/{len(queries)}] {query}")
-        say("─" * 64)
-        entry = {"query": query, "answer": None, "sources": [], "error": None}
-        try:
-            passages = _bm25_topk(query, chunks, top_k)
-            if not passages:
-                say("  No candidate passages.\n")
-                results.append(entry)
-                continue
-            all_picked.update(idx for idx, _, _ in passages)
-            entry["sources"] = [
-                {"n": j, "chunk": idx, "bm25": round(score, 2), "quote": _snippet(t)}
-                for j, (idx, score, t) in enumerate(passages, 1)
-            ]
-            if provider:
-                entry["answer"] = _ask_llm(query, passages, provider, model)
-                say(entry["answer"])
-            say("\nSources (verify against the filing URL above):")
-            for s in entry["sources"]:
-                say(f"  [{s['n']}] chunk #{s['chunk']}  score={s['bm25']}")
-                say(f"      \"{s['quote']}…\"")
-            say("")
-        except Exception as e:
-            entry["error"] = str(e)
-            say(f"  ERROR: {e}\n")
-        results.append(entry)
-
-    recall_line, recall_stats = _recall_note(chunks, all_picked)
-    say(recall_line)
-    say(f"{'='*64}\nDone.")
-
-    if as_json:
-        print(json.dumps({
-            "ticker": ticker.upper(),
-            "form": resolved_form,
-            "filing_date": filing["filing_date"],
-            "accession": filing["accession"],
-            "filing_url": filing["primary_doc_url"],
-            "llm": f"{provider}/{model}" if provider else None,
-            "results": results,
-            "recall_check": recall_stats,
-        }, indent=2))
+    _run(ticker, resolved_form, filing, text, top_k, custom_query, as_json, say)
 
 
 if __name__ == "__main__":
@@ -363,7 +553,13 @@ if __name__ == "__main__":
                    help="auto tries 10-Q → 10-K → 20-F → 40-F → 6-K")
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     p.add_argument("--query", help="Single custom question (skips the 5 default queries)")
+    p.add_argument("--demo", metavar="TICKER", nargs="?", const="AAPL",
+                   help="Run on a bundled cached filing — no network, no API key, "
+                        "no third-party deps (default AAPL)")
     p.add_argument("--json", action="store_true",
                    help="Emit structured JSON on stdout (progress goes to stderr)")
     args = p.parse_args()
-    run_light(args.ticker, args.form, args.top_k, args.query, as_json=args.json)
+    if args.demo:
+        run_demo(args.demo, args.top_k, args.query, as_json=args.json)
+    else:
+        run_light(args.ticker, args.form, args.top_k, args.query, as_json=args.json)
